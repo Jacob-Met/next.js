@@ -53,11 +53,13 @@ export class ProfilingPlugin {
     stopHook: any,
     {
       parentSpan,
+      reportToOtel = false,
       attrs,
       onStart,
       onStop,
     }: {
       parentSpan?: (...params: any[]) => Span
+      reportToOtel?: boolean
       attrs?: any
       onStart?: (span: Span, ...params: any[]) => void
       onStop?: (span: Span, ...params: any[]) => void
@@ -71,6 +73,7 @@ export class ProfilingPlugin {
         const attributes = attrs ? attrs(...params) : attrs
         span = new Span({
           name,
+          reportToOtel,
           parent: parentSpan ? parentSpan(...params) : this.runWebpackSpan,
           attrs: attributes,
         })
@@ -98,9 +101,10 @@ export class ProfilingPlugin {
       (compilation: webpack.Compilation) => {
         compilationSpan = new Span({
           name: 'webpack-compilation',
+          reportToOtel: true,
+          recordToInsights: true,
           parent: webpackInvalidSpans.get(compiler) || this.runWebpackSpan,
           attrs: normalizeTraceAttributes({ name: compiler.name }),
-          recordToInsights: true,
         })
         spans.set(compilation, compilationSpan)
         spans.set(compiler, compilationSpan)
@@ -118,15 +122,17 @@ export class ProfilingPlugin {
         (fileName: string | null) => {
           invalidationSpan = new Span({
             name: `webpack-invalidated-${compiler.name}`,
+            reportToOtel: true,
+            recordToInsights: true,
             parent: this.runWebpackSpan,
             attrs: {
+              'next.span_type': 'webpack-invalidated',
               trigger: fileName
                 ? path
                     .relative(this.rootDir, fileName)
                     .replaceAll(path.sep, '/')
                 : 'manual',
             },
-            recordToInsights: true,
           })
           webpackInvalidSpans.set(compiler, invalidationSpan)
         }
@@ -147,6 +153,7 @@ export class ProfilingPlugin {
     })
 
     this.traceHookPair('make', compiler.hooks.make, compiler.hooks.finishMake, {
+      reportToOtel: true,
       parentSpan: (compilation) => {
         const compilationSpan = spans.get(compilation)
         if (!compilationSpan) {
@@ -254,6 +261,7 @@ export class ProfilingPlugin {
           compilation.hooks.seal,
           compilation.hooks.afterSeal,
           {
+            reportToOtel: true,
             parentSpan: () => spans.get(compilation)!,
             onStart(span) {
               sealSpanByCompilation.set(compilation, span)
@@ -290,6 +298,7 @@ export class ProfilingPlugin {
           compilation.hooks.beforeChunks,
           compilation.hooks.afterChunks,
           {
+            reportToOtel: true,
             parentSpan: () =>
               sealSpanByCompilation.get(compilation) || spans.get(compilation)!,
           }
@@ -299,6 +308,7 @@ export class ProfilingPlugin {
           compilation.hooks.optimize,
           compilation.hooks.reviveModules,
           {
+            reportToOtel: true,
             parentSpan: () =>
               sealSpanByCompilation.get(compilation) || spans.get(compilation)!,
           }
@@ -308,6 +318,7 @@ export class ProfilingPlugin {
           compilation.hooks.optimizeModules,
           compilation.hooks.afterOptimizeModules,
           {
+            reportToOtel: true,
             parentSpan: () =>
               sealSpanByCompilation.get(compilation) || spans.get(compilation)!,
           }
@@ -317,6 +328,7 @@ export class ProfilingPlugin {
           compilation.hooks.optimizeChunks,
           compilation.hooks.afterOptimizeChunks,
           {
+            reportToOtel: true,
             parentSpan: () =>
               sealSpanByCompilation.get(compilation) || spans.get(compilation)!,
           }
@@ -326,6 +338,7 @@ export class ProfilingPlugin {
           compilation.hooks.optimizeTree,
           compilation.hooks.afterOptimizeTree,
           {
+            reportToOtel: true,
             parentSpan: () =>
               sealSpanByCompilation.get(compilation) || spans.get(compilation)!,
           }
@@ -335,6 +348,7 @@ export class ProfilingPlugin {
           compilation.hooks.optimizeChunkModules,
           compilation.hooks.afterOptimizeChunkModules,
           {
+            reportToOtel: true,
             parentSpan: () =>
               sealSpanByCompilation.get(compilation) || spans.get(compilation)!,
           }
@@ -344,6 +358,7 @@ export class ProfilingPlugin {
           compilation.hooks.beforeModuleHash,
           compilation.hooks.afterModuleHash,
           {
+            reportToOtel: true,
             parentSpan: () =>
               sealSpanByCompilation.get(compilation) || spans.get(compilation)!,
           }

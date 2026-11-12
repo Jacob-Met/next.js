@@ -6,12 +6,18 @@ import {
   PHASE_DEVELOPMENT_SERVER,
   PHASE_PRODUCTION_BUILD,
 } from '../shared/lib/constants'
-import { LocalRecordingSpan } from '../server/lib/trace/local-span-recorder'
 import { createJsonReporter } from './report/to-json'
 import type { Reporter } from './report/types'
 import type { TraceEvent } from './types'
+import {
+  getActiveLocalSpan,
+  recordSpan,
+  withLocalSpan,
+} from '../server/lib/trace/local-span-recorder'
 import { setGlobal } from './shared'
 import {
+  getTraceSpanSource,
+  createTraceSpan,
   clearTraceEvents,
   closeAllTraces,
   exportTraceState,
@@ -126,6 +132,85 @@ describe('Trace', () => {
       ])
     })
 
+    it('keeps explicit tooling HrTime completion on the monotonic clock', () => {
+      const span = createTraceSpan({
+        name: 'precise-completion',
+        monotonicStartTime: BigInt(1_000_000_001),
+        wallStartTimeMs: 1_700_000_000_000,
+      })
+      span.end([1, 1_234_568])
+      expect(getTraceEvents()).toMatchObject([
+        {
+          timestamp: 1_000_000,
+          startTime: 1_700_000_000_000,
+          duration: 1234,
+        },
+      ])
+    })
+
+    it('pairs local clocks using the shortest sample within bounded retries', () => {
+      const hrtime = jest
+        .spyOn(process.hrtime, 'bigint')
+        .mockReturnValueOnce(BigInt(1_000_000_000))
+        .mockReturnValueOnce(BigInt(1_050_000_000))
+        .mockReturnValueOnce(BigInt(1_100_000_000))
+        .mockReturnValueOnce(BigInt(1_120_000_000))
+        .mockReturnValueOnce(BigInt(1_200_000_000))
+        .mockReturnValueOnce(BigInt(1_230_000_000))
+      const wallTime = jest
+        .spyOn(Date, 'now')
+        .mockReturnValueOnce(1_700_000_000_050)
+        .mockReturnValueOnce(1_700_000_000_120)
+        .mockReturnValueOnce(1_700_000_000_230)
+      try {
+        const span = createTraceSpan({ name: 'interrupted capture' })
+        span.end([1, 100_000_000])
+        expect(getTraceEvents()).toMatchObject([
+          {
+            timestamp: 1_100_000,
+            startTime: 1_700_000_000_120,
+            duration: 0,
+          },
+        ])
+        expect(hrtime).toHaveBeenCalledTimes(6)
+        expect(wallTime).toHaveBeenCalledTimes(3)
+      } finally {
+        hrtime.mockRestore()
+        wallTime.mockRestore()
+      }
+    })
+
+    it('only inherits and activates local scope when requested', () => {
+      const outer = createTraceSpan({ name: 'outer' })
+      withLocalSpan(outer, () => {
+        recordSpan({ name: 'unscoped', synchronous: true }, () => {
+          expect(getActiveLocalSpan()).toBe(outer)
+        })
+        recordSpan(
+          { name: 'scoped', scope: true, synchronous: true },
+          (span) => {
+            expect(getActiveLocalSpan()).toBe(span)
+            recordSpan(
+              {
+                name: 'detached',
+                parent: null,
+                scope: true,
+                synchronous: true,
+              },
+              () => undefined
+            )
+          }
+        )
+      })
+      outer.end()
+      expect(getTraceEvents()).toMatchObject([
+        { name: 'unscoped', parentId: undefined },
+        { name: 'detached', parentId: undefined },
+        { name: 'scoped', parentId: getTraceSpanSource(outer)!.id },
+        { name: 'outer', parentId: undefined },
+      ])
+    })
+
     it('traces a block of code', async () => {
       const tmpDir = await makeTmpDir()
       setGlobal('distDir', tmpDir)
@@ -134,8 +219,6 @@ describe('Trace', () => {
       const root = trace('root-span', undefined, {
         'some-tag': 'some-value',
       })
-      expect(root).not.toBeInstanceOf(LocalRecordingSpan)
-      expect(root.recorder).toBeInstanceOf(LocalRecordingSpan)
       root.traceChild('child-span').traceFn(() => null)
       await root.traceChild('async-child-span').traceAsyncFn(async () => {
         const delayedPromise = new Promise((resolve) => {

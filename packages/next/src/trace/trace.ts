@@ -2,14 +2,32 @@ import { reporter } from './report'
 import {
   createRecordingSpan,
   type LocalRecordingSpan,
-  type LocalSpanOptions,
   recordSpan as recordSpanCallback,
+  type LocalSpanOptions,
 } from '../server/lib/trace/local-span-recorder'
-import type { SpanId, TraceEvent, TraceState } from './types'
+import type {
+  SpanId,
+  TraceEvent,
+  TraceState,
+  ReportingSpanSelection,
+} from './types'
 import type {
   AttributeValue,
   Span as OpenTelemetrySpan,
 } from '@opentelemetry/api'
+import { getTimestamp, toHrTime } from '../server/lib/trace/utils'
+import { getTraceClock } from './clock'
+
+let replay:
+  | typeof import('../server/lib/trace/local-span-replay.node')
+  | undefined
+
+if (process.env.NEXT_RUNTIME === 'edge') {
+  replay = undefined
+} else {
+  replay =
+    require('../server/lib/trace/local-span-replay.node') as typeof import('../server/lib/trace/local-span-replay.node')
+}
 
 const NUM_OF_MICROSEC_IN_NANOSEC = BigInt('1000')
 const NUM_OF_SEC_IN_NANOSEC = BigInt('1000000000')
@@ -23,6 +41,7 @@ const getId = () => {
 let defaultParentSpanId: SpanId | undefined
 let shouldSaveTraceEvents: boolean | undefined
 let savedTraceEvents: TraceEvent[] = []
+let savedReportingSpanSelections: ReportingSpanSelection[] = []
 
 const RECORD_SPAN_THRESHOLD_MS = parseInt(
   process.env.NEXT_TRACE_SPAN_THRESHOLD_MS ?? '-1'
@@ -37,10 +56,10 @@ export enum SpanStatus {
   Stopped = 'stopped',
 }
 
-type ReportingOptions = Pick<LocalSpanOptions, 'recordToInsights'> & {
-  scope?: boolean
-  parent?: LocalSpanOptions['parent'] | Span
-}
+type ReportingOptions = Pick<
+  LocalSpanOptions,
+  'reportToOtel' | 'recordToInsights' | 'reportingRoot'
+> & { scope?: boolean; parent?: LocalSpanOptions['parent'] | Span }
 
 export class Span {
   readonly recorder: LocalRecordingSpan
@@ -184,6 +203,7 @@ type SpanObservation = {
   startTime?: bigint
   endTime?: bigint
   attributes?: Record<string, unknown>
+  reportToOtel?: boolean
   recordToInsights?: boolean
 }
 
@@ -191,7 +211,7 @@ export function recordSpan(
   observation: SpanObservation,
   parent?: OpenTelemetrySpan
 ): void {
-  const clock = { monotonic: process.hrtime.bigint(), wallTimeMs: Date.now() }
+  const clock = getTraceClock()
   const nsPerMs = BigInt(1_000_000)
   // Preserve completed timestamps when mapping wall time onto the local clock.
   const correction = clock.monotonic - BigInt(clock.wallTimeMs) * nsPerMs
@@ -203,6 +223,7 @@ export function recordSpan(
     name: observation.name,
     attributes: observation.attributes,
     parent,
+    reportToOtel: observation.reportToOtel,
     recordToInsights: observation.recordToInsights,
     monotonicStartTime:
       observation.startTime !== undefined
@@ -212,7 +233,8 @@ export function recordSpan(
       observation.startTime !== undefined
         ? Number(observation.startTime / nsPerMs)
         : clock.wallTimeMs,
-  }).end(toHrTime(monotonicEndTime))
+    monotonicEndTime,
+  })
 }
 
 export type LocalSpanTiming = {
@@ -228,6 +250,7 @@ export type TraceSpanSource = {
   startTime: bigint
   wallStartTimeMs: number
   event?: TraceEvent
+  selectedId?: number
 }
 
 const traceSources = new WeakMap<OpenTelemetrySpan, TraceSpanSource>()
@@ -253,9 +276,9 @@ export function createTraceSpan(
     },
     ancestor
   )
-  const offset =
-    epochMillisecondsToNanoseconds(source.wallStartTimeMs) - source.startTime
-
+  const offset = BigInt(replay!.getClockOffset())
+  source.selectedId = options.reportToOtel ? source.id : ancestor?.selectedId
+  if (options.reportToOtel) selectTraceSpanSource(source, ancestor?.selectedId)
   const span = createRecordingSpan(
     {
       ...options,
@@ -264,6 +287,16 @@ export function createTraceSpan(
       clock: {
         start: source.startTime + offset,
         end: (time) => getTraceSpanEndTime(time) + offset,
+      },
+      reporting: {
+        id: source.id,
+        parentId: source.parentId,
+        attributes: {
+          'next.tooling.id': source.id,
+          ...(source.parentId === undefined
+            ? {}
+            : { 'next.tooling.parent_id': source.parentId }),
+        },
       },
       onError: (recording, error) => {
         recording.setAttribute('failed', true)
@@ -294,29 +327,25 @@ export function createTraceSpan(
 }
 
 export function captureTraceSpanSource(
-  options: LocalSpanTiming & { parent?: SpanId | null },
+  options: LocalSpanTiming & {
+    parent?: SpanId | null
+  },
   parent?: TraceSpanSource
 ): TraceSpanSource {
   const time = options.startTime
-  let epochMs: number | undefined
-  if (time instanceof Date) {
-    epochMs = time.getTime()
-  } else if (Array.isArray(time)) {
-    epochMs = time[0] * 1000 + time[1] / 1_000_000
-  } else if (typeof time === 'number') {
-    if (time < performance.timeOrigin / 2) {
-      epochMs = performance.timeOrigin + time
-    } else {
-      epochMs = time
-    }
+  const epochMs = time === undefined ? undefined : getTimestamp(time)
+  let monotonicStartTime = options.monotonicStartTime
+  let wallStartTimeMs = options.wallStartTimeMs ?? epochMs
+  if (monotonicStartTime === undefined || wallStartTimeMs === undefined) {
+    const clock = getTraceClock()
+    monotonicStartTime ??=
+      epochMs === undefined
+        ? clock.monotonic
+        : epochMillisecondsToNanoseconds(epochMs) +
+          clock.monotonic -
+          BigInt(clock.wallTimeMs) * NUM_OF_MILLISEC_IN_NANOSEC
+    wallStartTimeMs ??= clock.wallTimeMs
   }
-  const monotonicStartTime =
-    options.monotonicStartTime ??
-    (epochMs === undefined
-      ? process.hrtime.bigint()
-      : epochMillisecondsToNanoseconds(epochMs) +
-        process.hrtime.bigint() -
-        BigInt(Date.now()) * NUM_OF_MILLISEC_IN_NANOSEC)
   return {
     id: getId(),
     parentId:
@@ -324,16 +353,21 @@ export function captureTraceSpanSource(
         ? undefined
         : (options.parent ?? parent?.id ?? defaultParentSpanId),
     startTime: monotonicStartTime,
-    wallStartTimeMs: options.wallStartTimeMs ?? epochMs ?? Date.now(),
+    wallStartTimeMs,
   }
 }
 
-/** Existing end() accepts this lossless monotonic representation. */
-export function toHrTime(time: bigint): [number, number] {
-  return [
-    Number(time / NUM_OF_SEC_IN_NANOSEC),
-    Number(time % NUM_OF_SEC_IN_NANOSEC),
-  ]
+/** Records the selected worker hierarchy independently of SDK availability. */
+export function selectTraceSpanSource(
+  source: TraceSpanSource,
+  parentSelectedId?: SpanId
+): void {
+  if (shouldSaveTraceEvents) {
+    savedReportingSpanSelections.push({
+      id: source.id,
+      parentId: parentSelectedId ?? source.parentId,
+    })
+  }
 }
 
 // Multiply integer milliseconds as bigint so epoch magnitudes cannot lose the
@@ -346,7 +380,7 @@ function epochMillisecondsToNanoseconds(time: number): bigint {
   )
 }
 
-function getTraceSpanEndTime(
+export function getTraceSpanEndTime(
   endTime?: Parameters<OpenTelemetrySpan['end']>[0]
 ): bigint {
   if (Array.isArray(endTime)) {
@@ -355,12 +389,10 @@ function getTraceSpanEndTime(
     return process.hrtime.bigint()
   } else {
     const epochMs = endTime instanceof Date ? endTime.getTime() : endTime
+    const clock = getTraceClock()
     const correction =
-      process.hrtime.bigint() - BigInt(Date.now()) * NUM_OF_MILLISEC_IN_NANOSEC
-    const timeMs =
-      epochMs < performance.timeOrigin / 2
-        ? performance.timeOrigin + epochMs
-        : epochMs
+      clock.monotonic - BigInt(clock.wallTimeMs) * NUM_OF_MILLISEC_IN_NANOSEC
+    const timeMs = getTimestamp(epochMs)
     return epochMillisecondsToNanoseconds(timeMs) + correction
   }
 }
@@ -407,18 +439,38 @@ export const exportTraceState = (): TraceState => ({
   defaultParentSpanId,
   lastId: count,
   shouldSaveTraceEvents,
+  ...(shouldSaveTraceEvents
+    ? { reportingSpanSelections: savedReportingSpanSelections.slice() }
+    : {}),
+  ...(replay
+    ? {
+        otelClockOffset: replay.getClockOffset(),
+      }
+    : {}),
 })
 export const initializeTraceState = (state: TraceState) => {
   count = state.lastId
   defaultParentSpanId = state.defaultParentSpanId
   shouldSaveTraceEvents = state.shouldSaveTraceEvents
+  savedReportingSpanSelections = []
+
+  if (replay) {
+    replay.configureState(
+      defaultParentSpanId,
+      !!shouldSaveTraceEvents,
+      state.otelClockOffset
+    )
+  }
 }
 
 export function getTraceEvents(): TraceEvent[] {
   return savedTraceEvents
 }
 
-export function recordTraceEvents(events: TraceEvent[]) {
+export function recordTraceEvents(
+  events: TraceEvent[],
+  selections?: readonly ReportingSpanSelection[]
+) {
   for (const traceEvent of events) {
     traceEvent.tags = normalizeTraceAttributes(traceEvent.tags)
     reporter.report(traceEvent)
@@ -429,9 +481,11 @@ export function recordTraceEvents(events: TraceEvent[]) {
   if (shouldSaveTraceEvents) {
     savedTraceEvents.push(...events)
   }
+  replay?.replayWorkerEvents(events, selections)
 }
 
 export const clearTraceEvents = () => {
+  savedReportingSpanSelections = []
   return (savedTraceEvents = [])
 }
 
@@ -445,7 +499,8 @@ export const clearTraceEvents = () => {
  * such as completed observations passed to recordSpan().
  */
 export function hrtimeToEpochNanoseconds(hrtimeValue: bigint): bigint {
+  const clock = getTraceClock()
   const offset =
-    BigInt(Date.now()) * NUM_OF_MILLISEC_IN_NANOSEC - process.hrtime.bigint()
+    BigInt(clock.wallTimeMs) * NUM_OF_MILLISEC_IN_NANOSEC - clock.monotonic
   return hrtimeValue + offset
 }

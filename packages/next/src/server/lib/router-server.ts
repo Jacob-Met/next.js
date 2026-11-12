@@ -166,6 +166,7 @@ export async function initialize(opts: {
   experimentalHttpsServer?: boolean
   serverFastRefresh?: boolean
   startServerSpan?: Span
+  devServerSessionSpan?: Span
   quiet?: boolean
 }): Promise<ServerInitResult> {
   if (!process.env.NODE_ENV) {
@@ -244,9 +245,10 @@ export async function initialize(opts: {
 
     const { developmentBundler, developmentConfig } = await new Span({
       name: 'setup-dev-bundler',
-      parent: opts.startServerSpan,
+      reportToOtel: true,
       recordToInsights: true,
       scope: true,
+      parent: opts.startServerSpan,
     }).traceAsyncFn(async () => {
       // In development, it's always the complete config.
       const resolvedDevelopmentConfig = config as NextConfigComplete

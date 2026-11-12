@@ -108,9 +108,10 @@ store.subscribe((state) => {
       if (trigger !== 'initial') {
         traceSpan = new Span({
           name: 'compile-path',
-          attrs: { trigger },
           parent: getActiveLocalSpan(),
+          reportToOtel: true,
           recordToInsights: true,
+          attrs: { trigger },
         })
         if (!loadingLogTimer) {
           // Only log compiling if compiled is not finished quickly

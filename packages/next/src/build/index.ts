@@ -1,4 +1,3 @@
-import { getActiveLocalSpan } from '../server/lib/trace/local-span-recorder'
 import {
   getRouteCacheKey,
   ROUTE_CACHE_DIRECTORY,
@@ -131,7 +130,13 @@ import { generateBuildId } from './generate-build-id'
 import { isWriteable } from './is-writeable'
 import * as Log from './output/log'
 import createSpinner, { finishSpinner } from './spinner'
-import { Span, flushAllTraces, setGlobal } from '../trace'
+import {
+  Span,
+  exportTraceState,
+  flushAllTraces,
+  recordTraceEvents,
+  setGlobal,
+} from '../trace'
 import { readAnalyzeRoutes, writeAnalyzeSnapshot } from './analyze/snapshot'
 import { writeRouteBundleStats } from './route-bundle-stats'
 import {
@@ -1156,14 +1161,15 @@ export default async function build(
   try {
     const nextBuildSpan = new Span({
       name: 'next-build',
+      reportingRoot: true,
+      reportToOtel: true,
+      recordToInsights: true,
+      scope: true,
       attrs: {
         buildMode: experimentalBuildMode,
         version: process.env.__NEXT_VERSION as string,
         ...enabledFeatures,
       },
-      parent: getActiveLocalSpan(),
-      recordToInsights: true,
-      scope: true,
     })
 
     NextBuildContext.nextBuildSpan = nextBuildSpan
@@ -1260,6 +1266,16 @@ export default async function build(
       // events are captured if native bindings fail to load.
       const telemetry = new Telemetry({ distDir })
       setGlobal('telemetry', telemetry)
+      const { getSessionAttributes } =
+        require('../trace/session') as typeof import('../trace/session')
+      nextBuildSpan.recorder.setAttributes(
+        getSessionAttributes(
+          dir,
+          'build',
+          bundler === Bundler.Turbopack,
+          telemetry
+        )
+      )
 
       // Reuse the loaded config; ordinary builds do not load upgrade tooling.
       if (
@@ -1956,7 +1972,7 @@ export default async function build(
                     debuggerPortOffset: -1,
                     isolatedMemory: false,
                     numWorkers: 1,
-                    exposedMethods: ['collectBuildTraces'],
+                    exposedMethods: ['workerCollectBuildTraces'],
                     forkOptions: process.env.NEXT_CPU_PROF
                       ? {
                           env: {
@@ -1969,30 +1985,42 @@ export default async function build(
                   }
                 ) as Worker & typeof import('./collect-build-traces')
 
-                buildTracesPromise = new Span({
-                  name: 'collect-build-traces',
-                  parent: nextBuildSpan,
-                  recordToInsights: true,
-                  scope: true,
-                }).traceAsyncFn(() => {
-                  return buildTraceWorker
-                    .collectBuildTraces({
-                      dir,
-                      config,
-                      distDir,
-                      // Serialize Map as this is sent to the worker.
-                      edgeRuntimeRoutes: collectRoutesUsingEdgeRuntime(
-                        new Map()
-                      ),
-                      staticPages: [],
-                      buildTraceContext,
-                      outputFileTracingRoot,
-                    })
-                    .catch((err) => {
-                      console.error(err)
-                      throw err
-                    })
-                })
+                buildTracesPromise = nextBuildSpan
+                  .traceChild('collect-build-traces', undefined, {
+                    reportToOtel: true,
+                    recordToInsights: true,
+                    scope: true,
+                  })
+                  .traceAsyncFn((collectSpan) => {
+                    return buildTraceWorker
+                      .workerCollectBuildTraces({
+                        dir,
+                        config,
+                        distDir,
+                        // Serialize Map as this is sent to the worker.
+                        edgeRuntimeRoutes: collectRoutesUsingEdgeRuntime(
+                          new Map()
+                        ),
+                        staticPages: [],
+                        buildTraceContext,
+                        outputFileTracingRoot,
+                        traceState: {
+                          ...exportTraceState(),
+                          defaultParentSpanId: collectSpan!.getId(),
+                        },
+                      })
+                      .then(({ events, traceState }) => {
+                        recordTraceEvents(
+                          events,
+                          traceState.reportingSpanSelections
+                        )
+                      })
+                      .catch((err) => {
+                        console.error(err)
+                        throw err
+                      })
+                      .finally(() => buildTraceWorker.end())
+                  })
               }
             })
             if (!runServerAndEdgeInParallel) {
@@ -2368,6 +2396,14 @@ export default async function build(
 
       process.env.NEXT_PHASE = PHASE_PRODUCTION_BUILD
 
+      const { registerToolingBuildInstrumentation } =
+        require('../server/lib/router-utils/instrumentation-globals.external') as typeof import('../server/lib/router-utils/instrumentation-globals.external')
+      await registerToolingBuildInstrumentation(
+        dir,
+        distDir,
+        config.experimental.otelInBuild === true && hasInstrumentationHook
+      )
+
       staticWorker = createStaticWorker(config, {
         numberOfWorkers,
         debuggerPortOffset: getNextBuildDebuggerPortOffset({
@@ -2376,12 +2412,15 @@ export default async function build(
       })
 
       const analysisBegin = process.hrtime()
-      const staticCheckSpan = new Span({
-        name: 'static-check',
-        parent: nextBuildSpan,
-        recordToInsights: true,
-        scope: true,
-      })
+      const staticCheckSpan = nextBuildSpan.traceChild(
+        'static-check',
+        undefined,
+        {
+          reportToOtel: true,
+          recordToInsights: true,
+          scope: true,
+        }
+      )
 
       const functionsConfigManifest: FunctionsConfigManifest = {
         version: 1,
@@ -3053,28 +3092,29 @@ export default async function build(
         !isGenerateMode &&
         !buildTracesPromise
       ) {
-        buildTracesPromise = new Span({
-          name: 'collect-build-traces',
-          parent: nextBuildSpan,
-          recordToInsights: true,
-          scope: true,
-        }).traceAsyncFn(() => {
-          const { collectBuildTraces } =
-            require('./collect-build-traces') as typeof import('./collect-build-traces')
-          return collectBuildTraces({
-            dir,
-            config,
-            distDir,
-            edgeRuntimeRoutes: collectRoutesUsingEdgeRuntime(pageInfos),
-            staticPages: [...staticPages],
-            nextBuildSpan,
-            buildTraceContext,
-            outputFileTracingRoot,
-          }).catch((err) => {
-            console.error(err)
-            throw err
+        buildTracesPromise = nextBuildSpan
+          .traceChild('collect-build-traces', undefined, {
+            reportToOtel: true,
+            recordToInsights: true,
+            scope: true,
           })
-        })
+          .traceAsyncFn(() => {
+            const { collectBuildTraces } =
+              require('./collect-build-traces') as typeof import('./collect-build-traces')
+            return collectBuildTraces({
+              dir,
+              config,
+              distDir,
+              edgeRuntimeRoutes: collectRoutesUsingEdgeRuntime(pageInfos),
+              staticPages: [...staticPages],
+              nextBuildSpan,
+              buildTraceContext,
+              outputFileTracingRoot,
+            }).catch((err) => {
+              console.error(err)
+              throw err
+            })
+          })
       }
 
       if (serverPropsPages.size > 0 || ssgPages.size > 0) {
@@ -3247,13 +3287,15 @@ export default async function build(
           useDefaultStatic500 ||
           appDir)
       ) {
-        const staticGenerationSpan = new Span({
-          name: 'static-generation',
-          parent: nextBuildSpan,
-          recordToInsights: true,
-          scope: true,
-        })
-
+        const staticGenerationSpan = nextBuildSpan.traceChild(
+          'static-generation',
+          undefined,
+          {
+            reportToOtel: true,
+            recordToInsights: true,
+            scope: true,
+          }
+        )
         await staticGenerationSpan.traceAsyncFn(async () => {
           detectConflictingPaths(
             [
@@ -4963,7 +5005,9 @@ export default async function build(
 
     // Ensure all buffered spans are on disk before `uploadTrace` reads the file.
     flushAllTraces()
-
+    const { closeReporting } =
+      require('../server/lib/trace/local-span-replay.node') as typeof import('../server/lib/trace/local-span-replay.node')
+    closeReporting()
     teardownTraceSubscriber()
 
     if (traceUploadUrl && loadedConfig) {

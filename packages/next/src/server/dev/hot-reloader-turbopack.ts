@@ -1,4 +1,3 @@
-import { getActiveLocalSpan } from '../lib/trace/local-span-recorder'
 import { Span } from '../../trace'
 import type { Socket } from 'net'
 import { mkdir, writeFile } from 'fs/promises'
@@ -63,6 +62,7 @@ import {
   clearModuleContext,
 } from '../lib/render-server'
 import { denormalizePagePath } from '../../shared/lib/page-path/denormalize-page-path'
+import { getActiveLocalSpan } from '../lib/trace/local-span-recorder'
 import { recordSpan } from '../../trace/trace'
 import {
   AssetMapper,
@@ -475,9 +475,10 @@ export async function createHotReloaderTurbopack(
 
   const hotReloaderSpan = new Span({
     name: 'hot-reloader',
-    attrs: { version: process.env.__NEXT_VERSION as string },
     parent: getActiveLocalSpan(),
+    reportToOtel: true,
     recordToInsights: true,
+    attrs: { version: process.env.__NEXT_VERSION as string },
   })
   // Ensure the hotReloaderSpan is flushed immediately as it's the parentSpan for all processing
   // of the current `next dev` invocation.
@@ -1738,6 +1739,7 @@ export async function createHotReloaderTurbopack(
               recordSpan(
                 {
                   name: parsedData.spanName,
+                  reportToOtel: parsedData.reportToOtel === true,
                   startTime: msToNs(parsedData.startTime),
                   endTime: msToNs(parsedData.endTime),
                   attributes: parsedData.attributes,
@@ -1750,6 +1752,7 @@ export async function createHotReloaderTurbopack(
               recordSpan(
                 {
                   name: parsedData.event,
+                  reportToOtel: parsedData.reportToOtel === true,
                   recordToInsights: true,
                   startTime: msToNs(parsedData.startTime),
                   endTime: msToNs(parsedData.endTime),

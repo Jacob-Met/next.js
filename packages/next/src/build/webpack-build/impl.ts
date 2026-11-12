@@ -1,4 +1,3 @@
-import { getActiveLocalSpan } from '../../server/lib/trace/local-span-recorder'
 import { saveCpuProfile } from '../../server/lib/cpu-profile'
 // Compiler workers enter here without the CLI's Node environment initialization.
 // Install the baseline before any tracing module captures AsyncLocalStorage.
@@ -33,6 +32,7 @@ import loadConfig from '../../server/config'
 import {
   Span,
   getTraceEvents,
+  exportTraceState,
   initializeTraceState,
   setGlobal,
   type TraceEvent,
@@ -99,7 +99,7 @@ export async function webpackBuildImpl(
 
     // Create entrypoints - exclude deferred entries if configured
     const entrypoints = await nextBuildSpan
-      .traceChild('create-entrypoints')
+      .traceChild('create-entrypoints', undefined, { reportToOtel: true })
       .traceAsyncFn(() =>
         createEntrypoints({
           buildId: NextBuildContext.buildId!,
@@ -330,12 +330,13 @@ export async function webpackBuildImpl(
   const {
     clientConfig: clientWebpackConfig,
     serverConfig: serverWebpackConfig,
-  } = await new Span({
-    name: 'run-webpack-compiler',
-    parent: nextBuildSpan,
-    recordToInsights: true,
-    scope: true,
-  }).traceAsyncFn(runWebpackCompiler)
+  } = await nextBuildSpan
+    .traceChild('run-webpack-compiler', undefined, {
+      reportToOtel: true,
+      recordToInsights: true,
+      scope: true,
+    })
+    .traceAsyncFn(runWebpackCompiler)
   result = nextBuildSpan
     .traceChild('format-webpack-messages')
     .traceFn(() => formatWebpackMessages(result, true)) as CompilerResult
@@ -424,6 +425,7 @@ export async function workerMain(workerData: {
 }): Promise<
   Awaited<ReturnType<typeof webpackBuildImpl>> & {
     debugTraceEvents: TraceEvent[]
+    debugTraceSelections: TraceState['reportingSpanSelections']
   }
 > {
   // Clone the telemetry for worker
@@ -453,8 +455,11 @@ export async function workerMain(workerData: {
   await installBindings(config.experimental?.useWasmBinary)
   NextBuildContext.nextBuildSpan = new Span({
     name: `worker-main-${workerData.compilerName}`,
-    parent: getActiveLocalSpan(),
+    reportToOtel: true,
     recordToInsights: true,
+    attrs: {
+      'next.span_type': 'worker-main',
+    },
   })
 
   const result = await webpackBuildImpl(workerData.compilerName)
@@ -482,5 +487,6 @@ export async function workerMain(workerData: {
   return {
     ...result,
     debugTraceEvents: getTraceEvents(),
+    debugTraceSelections: exportTraceState().reportingSpanSelections,
   }
 }
