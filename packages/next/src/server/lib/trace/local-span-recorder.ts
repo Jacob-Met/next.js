@@ -11,6 +11,7 @@ import {
   isLocalSpanRecordingEnabled,
   isLocalSpanSinkActive,
   captureLocalSpanRecorder,
+  isRequestInsightsEnabled,
   type SpanStoreAttributes,
   type SpanStoreEvent,
   type SpanStoreLink,
@@ -49,6 +50,7 @@ export type LocalSpanOptions = {
   isolateOpenTelemetry?: boolean
   clock?: { start: bigint; end(time?: Parameters<Span['end']>[0]): bigint }
   onError?: (span: LocalRecordingSpan, error: unknown) => void
+  recordToInsights?: boolean
 }
 
 export type LocalSpanDelivery = (
@@ -132,7 +134,100 @@ export function createRecordingSpan(
     recordSpans,
     isolateOpenTelemetry: options.isolateOpenTelemetry ?? true,
   })
+  if (
+    options.recordToInsights &&
+    process.env.__NEXT_DEV_SERVER &&
+    process.env.NEXT_RUNTIME !== 'edge'
+  ) {
+    const type = options.attributes?.['next.span_type']
+    span.addDelivery(
+      captureInsightSpanRecorder(
+        span,
+        parent ?? undefined,
+        options.name,
+        typeof type === 'string' ? type : options.name
+      )
+    )
+  }
   return span
+}
+
+type RequestSpanIdentity = ReturnType<typeof getCurrentRequestIdentity>
+type ActivityInsight = {
+  identity: RequestSpanIdentity
+  rootSpanId: string | undefined
+  started: boolean
+}
+const activityInsights = new WeakMap<Span, ActivityInsight>()
+
+function captureRequestSpanRecorder(
+  identity: RequestSpanIdentity
+): LocalSpanDelivery {
+  const deliver = captureLocalSpanRecorder()
+  return (spans) => {
+    for (const span of spans) {
+      span.requestId = identity.requestId
+      span.requestInsightKind = identity.requestInsightKind
+      span.requestInsightSource = identity.requestInsightSource
+      span.requestInsightProxyStatus = identity.requestInsightProxyStatus
+      span.htmlRequestId = identity.htmlRequestId
+      span.route ??= identity.route
+      span.url ??= identity.url
+    }
+    deliver(spans)
+  }
+}
+
+function captureInsightSpanRecorder(
+  span: Span,
+  parent: Span | undefined,
+  name: string,
+  type: string
+): LocalSpanDelivery {
+  const identity = getCurrentRequestIdentity()
+  let insight = parent?.isRecording() ? activityInsights.get(parent) : undefined
+  if (identity.requestId) {
+    insight = { identity, rootSpanId: undefined, started: true }
+  } else if (!insight) {
+    const requestId = span.spanContext().spanId
+    insight = {
+      identity: {
+        requestId,
+        requestInsightKind: 'tooling',
+        requestInsightSource: 'tooling',
+        htmlRequestId: requestId,
+        route: name,
+      },
+      rootSpanId: span.spanContext().spanId,
+      started: false,
+    }
+  }
+  activityInsights.set(span, insight)
+  const scoped = isLocalSpanSinkActive()
+  const deliver = captureRequestSpanRecorder(insight.identity)
+  return (spans) => {
+    if (!scoped && !insight.started && isRequestInsightsEnabled()) {
+      const { startRequestInsight } =
+        require('./request-insights') as typeof import('./request-insights')
+      startRequestInsight({
+        requestId: insight.identity.requestId,
+        kind: 'tooling',
+        source: 'tooling',
+        route: insight.identity.route,
+      })
+      insight.started = true
+    }
+    for (const record of spans) {
+      record.requestInsightRoot = record.spanId === insight.rootSpanId
+      record.attributes = {
+        ...record.attributes,
+        'next.span_category': 'tooling',
+        'next.span_type': type,
+        'next.span_name': name,
+      }
+    }
+    deliver(spans)
+  }
 }
 
 type RequestSpanOptions = Omit<
@@ -145,24 +240,9 @@ type RequestSpanOptions = Omit<
 export function createLocalSpan(
   options: RequestSpanOptions
 ): LocalRecordingSpan {
-  const identity = getCurrentRequestIdentity()
-  const deliver = captureLocalSpanRecorder()
   return createRecordingSpan(
     { ...options, isolateOpenTelemetry: options.isolateOpenTelemetry ?? false },
-    (spans) => {
-      // The recorder creates these records for this delivery callback alone.
-      // Enrich before publishing, without another array or record allocation.
-      for (const span of spans) {
-        span.requestId = identity.requestId
-        span.requestInsightKind = identity.requestInsightKind
-        span.requestInsightSource = identity.requestInsightSource
-        span.requestInsightProxyStatus = identity.requestInsightProxyStatus
-        span.htmlRequestId = identity.htmlRequestId
-        span.route ??= identity.route
-        span.url ??= identity.url
-      }
-      deliver(spans)
-    }
+    captureRequestSpanRecorder(getCurrentRequestIdentity())
   )
 }
 
@@ -250,9 +330,7 @@ export function withLocalSpan<T>(
 }
 
 /**
- * Records an operation without changing local or public OpenTelemetry scope.
- * Parents are explicit; request integration owns inherited parent resolution
- * and establishes its own local scope around the callback.
+ * Scope is explicit so fine observations do not change surrounding parentage.
  *
  * The default remains asynchronous, including setup errors. Explicit synchronous
  * mode ends on return/throw without awaiting a returned promise.
@@ -334,18 +412,21 @@ export function registerLocalSpanRecorder({
 export function recordSpan<T>(
   options: (LocalSpanOptions | TraceExistingLocalSpanOptions) & {
     synchronous: true
+    scope?: boolean
   },
   fn: (span: LocalRecordingSpan) => T
 ): T
 export function recordSpan<T>(
   options: (LocalSpanOptions | TraceExistingLocalSpanOptions) & {
     synchronous?: false
+    scope?: boolean
   },
   fn: (span: LocalRecordingSpan) => T | Promise<T>
 ): Promise<T>
 export function recordSpan<T>(
   options: (LocalSpanOptions | TraceExistingLocalSpanOptions) & {
     synchronous?: boolean
+    scope?: boolean
   },
   fn: (span: LocalRecordingSpan) => T | Promise<T>
 ): T | Promise<T> {
@@ -364,7 +445,13 @@ export function recordSpan<T>(
       } else {
         span = (traceAdapter ??=
           require('../../../trace/trace') as typeof import('../../../trace/trace')).createTraceSpan(
-          options
+          {
+            ...options,
+            parent:
+              options.scope && options.parent === undefined
+                ? getActiveLocalSpan()
+                : options.parent,
+          }
         )
       }
     }
@@ -387,6 +474,13 @@ export function recordSpan<T>(
       } finally {
         if (!pending) span.end()
       }
+    }
+    if (options.scope) {
+      const { api } = require('./otel-api') as typeof import('./otel-api')
+      const { context, ROOT_CONTEXT } = api
+      return context.with(ROOT_CONTEXT, () =>
+        withLocalSpan(span, execute, undefined, false)
+      )
     }
     return execute()
   }
@@ -530,6 +624,17 @@ export class LocalRecordingSpan implements Span {
       delegate.span.addEvent(event.name, event.attributes, event.timestamp)
       if (!canUse()) return
       delegate.eventsForwarded = i + 1
+    }
+  }
+
+  addDelivery(deliver: LocalSpanDelivery): void {
+    const previous = this.recordSpans
+    this.recordSpans = (spans, end) => {
+      try {
+        previous?.(spans, end)
+      } finally {
+        deliver(spans, end)
+      }
     }
   }
 

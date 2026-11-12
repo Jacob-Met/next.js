@@ -1,4 +1,3 @@
-import { toHrTime } from '../server/lib/trace/utils'
 import { reporter } from './report'
 import {
   createRecordingSpan,
@@ -38,9 +37,15 @@ export enum SpanStatus {
   Stopped = 'stopped',
 }
 
+type ReportingOptions = Pick<LocalSpanOptions, 'recordToInsights'> & {
+  scope?: boolean
+  parent?: LocalSpanOptions['parent'] | Span
+}
+
 export class Span {
   readonly recorder: LocalRecordingSpan
 
+  private readonly scope: boolean
   constructor({
     name,
     parentId,
@@ -48,21 +53,30 @@ export class Span {
     attrs,
     startTime,
     wallStartTimeMs,
+    scope = false,
+    ...reporting
   }: {
     name: string
     parentId?: SpanId
-    parent?: Span
     attrs?: Attributes
     startTime?: bigint
     wallStartTimeMs?: number
-  }) {
+  } & ReportingOptions) {
     this.recorder = createTraceSpan({
+      ...reporting,
+      scope,
       name,
-      parent: parent?.recorder ?? parentId,
+      parent:
+        parent instanceof Span
+          ? parent.recorder
+          : parent === undefined
+            ? parentId
+            : parent,
       attributes: attrs,
       monotonicStartTime: startTime,
       wallStartTimeMs,
     })
+    this.scope = scope
   }
 
   get name(): string {
@@ -73,18 +87,23 @@ export class Span {
     this.recorder.end(stopTime === undefined ? undefined : toHrTime(stopTime))
   }
 
-  traceChild(name: string, attrs?: Attributes): Span {
-    return new Span({ name, parent: this, attrs })
+  traceChild(
+    name: string,
+    attrs?: Attributes,
+    options?: ReportingOptions
+  ): Span {
+    return new Span({ ...options, name, parent: this, attrs })
   }
 
   manualTraceChild(
     name: string,
     startTime?: bigint,
     stopTime?: bigint,
-    attrs?: Attributes
+    attrs?: Attributes,
+    options?: ReportingOptions
   ): void {
     recordSpan(
-      { name, startTime, endTime: stopTime, attributes: attrs },
+      { ...options, name, startTime, endTime: stopTime, attributes: attrs },
       this.recorder
     )
   }
@@ -102,18 +121,25 @@ export class Span {
   }
 
   traceFn<T>(fn: (span: Span) => T): T {
-    return recordSpanCallback({ span: this.recorder, synchronous: true }, () =>
-      fn(this)
+    return recordSpanCallback(
+      { span: this.recorder, scope: this.scope, synchronous: true },
+      () => fn(this)
     )
   }
 
   traceAsyncFn<T>(fn: (span: Span) => T | Promise<T>): Promise<T> {
-    return recordSpanCallback({ span: this.recorder }, () => fn(this))
+    return recordSpanCallback({ span: this.recorder, scope: this.scope }, () =>
+      fn(this)
+    )
   }
 }
 
-export const trace = (name: string, parentId?: SpanId, attrs?: Attributes) =>
-  new Span({ name, parentId, attrs })
+export const trace = (
+  name: string,
+  parentId?: SpanId,
+  attrs?: Attributes,
+  options?: ReportingOptions
+) => new Span({ ...options, name, parentId, attrs })
 
 export function normalizeTraceAttributes(
   attributes: Attributes | undefined
@@ -158,6 +184,7 @@ type SpanObservation = {
   startTime?: bigint
   endTime?: bigint
   attributes?: Record<string, unknown>
+  recordToInsights?: boolean
 }
 
 export function recordSpan(
@@ -176,6 +203,7 @@ export function recordSpan(
     name: observation.name,
     attributes: observation.attributes,
     parent,
+    recordToInsights: observation.recordToInsights,
     monotonicStartTime:
       observation.startTime !== undefined
         ? observation.startTime + correction
@@ -239,8 +267,14 @@ export function createTraceSpan(
       },
       onError: (recording, error) => {
         recording.setAttribute('failed', true)
-        recording.recordException(error as Error)
-        recording.setStatus({ code: 2 })
+        if (options.scope) {
+          const { recordSpanError } =
+            require('../server/lib/trace/tracer') as typeof import('../server/lib/trace/tracer')
+          recordSpanError(recording, error as Error)
+        } else {
+          recording.recordException(error as Error)
+          recording.setStatus({ code: 2 })
+        }
       },
     },
     (records, end) => {
@@ -292,6 +326,14 @@ export function captureTraceSpanSource(
     startTime: monotonicStartTime,
     wallStartTimeMs: options.wallStartTimeMs ?? epochMs ?? Date.now(),
   }
+}
+
+/** Existing end() accepts this lossless monotonic representation. */
+export function toHrTime(time: bigint): [number, number] {
+  return [
+    Number(time / NUM_OF_SEC_IN_NANOSEC),
+    Number(time % NUM_OF_SEC_IN_NANOSEC),
+  ]
 }
 
 // Multiply integer milliseconds as bigint so epoch magnitudes cannot lose the
