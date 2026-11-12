@@ -22,6 +22,11 @@ describe('app dir - not-found - dynamic segment notFound()', () => {
     const markup = rawHtml.replace(/<script\b[\s\S]*?<\/script>/g, '')
     expect(markup).toContain('Custom not-found copy')
     expect(markup).toContain('Site Header')
+
+    const browser = await next.browser('/nope')
+    expect(
+      await browser.eval(() => (window as any).notFoundCriticalScriptExecuted)
+    ).toBe(true)
   })
 
   it('should have parity with an unmatched route', async () => {

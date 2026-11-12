@@ -2233,7 +2233,10 @@ function nearestNotFoundLoaderTree(tree: LoaderTree): LoaderTree | null {
     segment,
     // Preserve sibling parallel route slots and swap the children slot for the
     // nearest not-found component.
-    { ...parallelRoutes, children: [PAGE_SEGMENT_KEY, {}, { page: notFound }, null] },
+    {
+      ...parallelRoutes,
+      children: [PAGE_SEGMENT_KEY, {}, { page: notFound }, null],
+    },
     components,
     staticSiblings,
   ]
@@ -2530,12 +2533,17 @@ function ErrorApp<T>({
 
   const actionQueue = createMutableActionQueue(initialState)
 
+  const { HeadManagerContext } =
+    require('../../shared/lib/head-manager-context.shared-runtime') as typeof import('../../shared/lib/head-manager-context.shared-runtime')
+
   return (
-    <ImageConfigContext.Provider value={images ?? imageConfigDefault}>
-      <ServerInsertedHTMLProvider>
-        <AppRouter actionQueue={actionQueue} globalErrorState={response.G} />
-      </ServerInsertedHTMLProvider>
-    </ImageConfigContext.Provider>
+    <HeadManagerContext.Provider value={{ appDir: true, nonce }}>
+      <ImageConfigContext.Provider value={images ?? imageConfigDefault}>
+        <ServerInsertedHTMLProvider>
+          <AppRouter actionQueue={actionQueue} globalErrorState={response.G} />
+        </ServerInsertedHTMLProvider>
+      </ImageConfigContext.Provider>
+    </HeadManagerContext.Provider>
   )
   /* eslint-enable @next/internal/no-ambiguous-jsx -- React Client */
 }
