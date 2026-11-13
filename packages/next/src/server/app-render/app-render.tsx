@@ -10674,6 +10674,15 @@ async function prerenderToStream(
         isFallbackUpgradeable: renderOpts.isFallbackUpgradeable === true,
       }
 
+      // A completed static 404 should render its nearest not-found boundary
+      // into the initial document. A dynamic prerender still needs its
+      // resumable shell, and fallback parameter routes retain their original
+      // recovery path.
+      const recoverCompletedStaticNotFound =
+        errorType === 'not-found' &&
+        originalFlightPrerenderResultIsDynamic === false &&
+        (fallbackRouteParams === null || fallbackRouteParams.size === 0)
+
       const errorRSCPayload = await workUnitAsyncStorage.run(
         errorPrerenderStore,
         getErrorRSCPayload,
@@ -10681,9 +10690,9 @@ async function prerenderToStream(
         ctx,
         reactServerErrorsByDigest.has((err as any)?.digest) ? undefined : err,
         errorType,
-        // The recovery shell only bootstraps the original Flight data. Avoid
-        // blocking that shell on error-page metadata or viewport.
-        false,
+        // For completed static 404s the fallback is the document, not just a
+        // resumable shell. Other recovery paths bootstrap the original data.
+        recoverCompletedStaticNotFound,
         true
       )
 
@@ -10921,9 +10930,24 @@ async function prerenderToStream(
           )
         }
 
+        // The fallback HTML must hydrate from its own Flight data. Keeping
+        // the failed page's original Flight can leave visible 404 links inert.
+        const inlinedFlightPrerenderResult = recoverCompletedStaticNotFound
+          ? errorServerResult
+          : originalFlightPrerenderResult
+        if (recoverCompletedStaticNotFound) {
+          const recoveredChunks = errorServerResult.asChunks()
+          metadata.flightData = Buffer.concat(
+            cachedNavigations
+              ? prependIsPartialByteToChunks(recoveredChunks, false)
+              : recoveredChunks
+          )
+          originalFlightPrerenderResult.consume()
+        }
+
         const stream = await continueStaticPrerenderWithInlinedData(
           errorHtmlStream,
-          originalFlightPrerenderResult,
+          inlinedFlightPrerenderResult,
           fallbackRouteParams,
           createInlinedDataStream,
           externalBrowserRuntime,
@@ -10940,7 +10964,9 @@ async function prerenderToStream(
           errorBootstrapScriptContent
         )
 
-        errorServerResult.consume()
+        if (!recoverCompletedStaticNotFound) {
+          errorServerResult.consume()
+        }
         return {
           error: errorType !== undefined ? undefined : { thrownValue: err },
           digestErrorsMap: renderErrorsByDigest,
