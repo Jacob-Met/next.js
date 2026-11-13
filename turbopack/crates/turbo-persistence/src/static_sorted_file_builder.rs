@@ -28,6 +28,11 @@ use crate::{
 /// Size of the per-block header on disk: 4 bytes uncompressed_size + 4 bytes CRC32 checksum.
 pub const BLOCK_HEADER_SIZE: usize = 8;
 
+/// Capacity of the buffered writer for SST files. Must be well above the typical block size, so
+/// that each block (8–12 KB small-value blocks, up to 16 KB key blocks) doesn't force its own
+/// `write` syscall.
+const FILE_WRITE_BUFFER_SIZE: usize = 256 * 1024;
+
 /// The maximum number of entries that should go into a single key block
 const MAX_KEY_BLOCK_ENTRIES: usize = MAX_KEY_BLOCK_SIZE / KEY_BLOCK_ENTRY_META_OVERHEAD;
 /// The maximum bytes that should go into a single key block
@@ -142,7 +147,7 @@ impl KeyBlockFormat {
     }
 }
 
-/// Copy-able snapshot of the accumulator state needed by [`flush_key_block`].
+/// Copy-able snapshot of the accumulator state needed by [`StreamingSstWriter::flush_key_block`].
 #[derive(Clone, Copy)]
 struct KeyBlockFlushInfo {
     max_key_len: usize,
@@ -641,7 +646,7 @@ impl<E: Entry> StreamingSstWriter<E> {
         compression: Compression,
     ) -> Result<Self> {
         let file_path = file.to_owned();
-        let file = BufWriter::new(File::create(file)?);
+        let file = BufWriter::with_capacity(FILE_WRITE_BUFFER_SIZE, File::create(file)?);
         let compressor = Compressor::new(compression)?;
 
         // Estimate number of key blocks based on max entry count.
@@ -866,7 +871,7 @@ impl<E: Entry> StreamingSstWriter<E> {
     /// Advances `first_pending_small_index` past the just-pushed entry if it is resolved and
     /// sits right at the current boundary. Flushes complete key blocks incrementally.
     ///
-    /// Must be called immediately after [`push_pending_key_entry`] with a resolved
+    /// Must be called immediately after [`Self::push_pending_key_entry`] with a resolved
     /// (non-`PendingSmall`) entry.
     fn try_flush_key_blocks(&mut self) -> Result<()> {
         debug_assert!(!matches!(
@@ -1169,7 +1174,7 @@ impl<E: Entry> StreamingSstWriter<E> {
     /// Flushes all remaining entries as key blocks. Called from `close()` after all small value
     /// blocks have been flushed, so all PendingSmall entries are resolved.
     ///
-    /// This loop mirrors [`advance_boundary_to`], but uses a local accumulator (since the
+    /// This loop mirrors [`Self::advance_boundary_to`], but uses a local accumulator (since the
     /// `self.current_key_block` state is stale) and flushes the final incomplete block
     /// (unlike `advance_boundary_to`, which keeps it for more entries during streaming).
     fn flush_remaining_key_blocks(&mut self) -> Result<()> {
@@ -1325,8 +1330,9 @@ const FIXED_KEY_BLOCK_HEADER_SIZE: usize = 6;
 /// search probes are contiguous: the search region holds only what the lookup compares first (the
 /// hash for `HashThenKey`, the key for `KeyOnly`), and everything else follows in the tail region,
 /// addressed by the same entry index. [`FixedRegions`] derives that geometry for both this builder
-/// and the reader; see [`KEY_BLOCK_TABLE_ENTRY_SIZE_WITH_HASH`] for why the compared bytes are
-/// hoisted out of the payload.
+/// and the reader; see
+/// [`KEY_BLOCK_TABLE_ENTRY_SIZE_WITH_HASH`](crate::static_sorted_file::KEY_BLOCK_TABLE_ENTRY_SIZE_WITH_HASH)
+/// for why the compared bytes are hoisted out of the payload.
 struct FixedKeyBlockBuilder<'l> {
     /// Receives the header and then the search region.
     buffer: &'l mut Vec<u8>,
@@ -2430,6 +2436,89 @@ mod tests {
         // Corrupt a byte in the first block's data (after the 8-byte header)
         corrupt_sst_byte(dir.path(), 1, BLOCK_HEADER_SIZE as u64 + 1);
         assert_corruption_detected(dir.path(), 1, &meta, &entries);
+    }
+
+    /// Overwriting the directory entry of any non-index block of a real SST with an offset
+    /// outside the data section must make lookup in every access mode and file-backed iteration
+    /// fail to open it, with the block-offset validation error rather than a panic or later error.
+    #[test]
+    fn corrupt_block_offsets_are_rejected_on_open() -> Result<()> {
+        let mut entries = vec![TestEntry::medium(b"medium", &vec![0xAB; 8192])];
+        for i in 0..64u32 {
+            entries.push(TestEntry::small(
+                format!("small-{i:04}").as_bytes(),
+                &[i as u8; 64],
+            ));
+        }
+        sort_entries(&mut entries);
+
+        let dir = tempfile::tempdir()?;
+        let written = write_sst(dir.path(), 1, &entries, MetaEntryFlags::default())?;
+        let meta = StaticSortedFileMetaData {
+            sequence_number: 1,
+            block_count: written.block_count,
+        };
+        assert!(
+            meta.block_count >= 3,
+            "expected value, key and index blocks, got {} blocks",
+            meta.block_count
+        );
+        let path = dir.path().join("00000001.sst");
+        let original = std::fs::read(&path)?;
+        let directory_start = original.len() - usize::from(meta.block_count) * size_of::<u32>();
+        // Sanity check: the uncorrupted file reads back with the expected values.
+        let sst = open_sst(dir.path(), 1, &written)?;
+        let kc = make_cache();
+        let vc = make_cache();
+        for entry in &entries {
+            assert_lookup(&sst, entry, &kc, &vc)?;
+        }
+        // The caches can hold blocks that reference the mapping, so release them with the file
+        // before the file is rewritten below.
+        drop((sst, kc, vc));
+
+        let access_modes: &[crate::AccessMode] = &[
+            #[cfg(feature = "mmap")]
+            crate::AccessMode::Mmap,
+            crate::AccessMode::File,
+        ];
+        for block_index in 0..usize::from(meta.block_count) - 1 {
+            for bad_end in [u32::MAX, directory_start as u32 + 4] {
+                let mut bytes = original.clone();
+                let entry = directory_start + block_index * size_of::<u32>();
+                bytes[entry..entry + size_of::<u32>()].copy_from_slice(&bad_end.to_be_bytes());
+                std::fs::write(&path, &bytes)?;
+                for &access_mode in access_modes {
+                    let errors = [
+                        StaticSortedFile::open(dir.path(), meta, Compression::Lz4, access_mode)
+                            .err(),
+                        crate::static_sorted_file::StaticSortedFileIter::open(
+                            dir.path(),
+                            meta,
+                            Compression::Lz4,
+                        )
+                        .err(),
+                    ];
+                    for err in errors {
+                        let err = err.unwrap_or_else(|| {
+                            panic!(
+                                "block {block_index}, end {bad_end} ({access_mode:?}): a corrupt \
+                                 block offset was accepted"
+                            )
+                        });
+                        let message = format!("{err:#}");
+                        // Raising one block's end either makes the next block go backwards, or
+                        // (for the last data block) pushes the blocks past the table.
+                        assert!(
+                            message.contains("shorter than its")
+                                || message.contains("past the start of its block-offset table"),
+                            "block {block_index}, end {bad_end} ({access_mode:?}): {message}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
