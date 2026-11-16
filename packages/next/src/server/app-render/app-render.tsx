@@ -1,5 +1,8 @@
 import type { ComponentType, ErrorInfo, JSX, ReactNode } from 'react'
-import type { PartialTransportData } from '../../shared/lib/rsc-transport'
+import type {
+  FullTransportNode,
+  PartialTransportData,
+} from '../../shared/lib/rsc-transport'
 import type { RenderOpts, PreloadCallbacks } from './types'
 import type {
   ActionResult,
@@ -2205,13 +2208,89 @@ function Preloads({ preloadCallbacks }: { preloadCallbacks: Function[] }) {
   return null
 }
 
+function nearestNotFoundLoaderTree(tree: LoaderTree): LoaderTree | null {
+  const [segment, parallelRoutes, components, staticSiblings] = tree
+  const children = parallelRoutes.children
+  if (children) {
+    const nested = nearestNotFoundLoaderTree(children)
+    if (nested !== null) {
+      return [
+        segment,
+        // Preserve sibling parallel route slots so that layouts with parallel routes
+        // (e.g. @modal, @sidebar) retain their layout structure and slots
+        // when rendering the nearest not-found boundary inside the layout.
+        { ...parallelRoutes, children: nested },
+        components,
+        staticSiblings,
+      ]
+    }
+  }
+  const notFound = components['not-found']
+  if (!notFound) {
+    return null
+  }
+  return [
+    segment,
+    // Preserve sibling parallel route slots and swap the children slot for the
+    // nearest not-found component.
+    {
+      ...parallelRoutes,
+      children: [PAGE_SEGMENT_KEY, {}, { page: notFound }, null],
+    },
+    components,
+    staticSiblings,
+  ]
+}
+
+async function notFoundTransportTree(
+  tree: LoaderTree,
+  ctx: AppRenderContext,
+  hintTree: PrefetchHints | null,
+  isPrerendering: boolean
+): Promise<FullTransportNode | null> {
+  const nearestTree = nearestNotFoundLoaderTree(tree)
+  const loaderTree =
+    nearestTree !== null
+      ? nearestTree
+      : tree[2]['global-not-found']
+        ? createNotFoundLoaderTree(tree)
+        : null
+  if (loaderTree === null) {
+    return null
+  }
+  try {
+    return await createFullComponentTree({
+      ctx,
+      loaderTree,
+      parentParams: {},
+      parentOptionalCatchAllParamName: null,
+      parentRuntimePrefetchable: false,
+      rootLayoutIncluded: false,
+      injectedCSS: new Set(),
+      injectedJS: new Set(),
+      injectedFontPreloadTags: new Set(),
+      preloadCallbacks: [],
+      authInterrupts: ctx.renderOpts.experimental.authInterrupts,
+      MetadataOutlet: () => null,
+      isPrerendering,
+      hintTree,
+    })
+  } catch (err) {
+    if (process.env.NODE_ENV === 'development') {
+      console.error('Failed to construct server not-found boundary:', err)
+    }
+    return null
+  }
+}
+
 // This is the data necessary to render <AppRouter /> when an error state is triggered
 async function getErrorRSCPayload(
   tree: LoaderTree,
   ctx: AppRenderContext,
   ssrError: unknown,
   errorType: MetadataErrorType | 'redirect' | undefined,
-  shouldRenderMetadataAndViewport: boolean
+  shouldRenderMetadataAndViewport: boolean,
+  isPrerendering: boolean = false
 ) {
   const {
     getDynamicParamFromSegment,
@@ -2288,22 +2367,33 @@ async function getErrorRSCPayload(
     )
   )
 
-  const partialPrefetching =
-    Boolean(ctx.renderOpts.partialPrefetching) ||
-    (await anySegmentHasPartialPrefetchingEnabled(tree))
+  let initialTree: FullTransportNode | null = null
+  if (errorType === 'not-found' && shouldRenderMetadataAndViewport) {
+    initialTree = await notFoundTransportTree(
+      tree,
+      ctx,
+      errorHints,
+      isPrerendering
+    )
+  }
+  if (initialTree === null) {
+    const partialPrefetching =
+      Boolean(ctx.renderOpts.partialPrefetching) ||
+      (await anySegmentHasPartialPrefetchingEnabled(tree))
 
-  const initialTree = await createFullTransportTreeFromLoaderTree(
-    tree,
-    errorHints,
-    errorPrefetchInliningEnabled,
-    ctx.missingPrefetchHintPolicy,
-    partialPrefetching,
-    getDynamicParamFromSegment,
-    ctx.renderOpts.notFoundParams
-  )
-  // Attach the error shell as the root's render output. Vary params are not
-  // tracked for error pages.
-  initialTree.d = { r: errorShell, p: false, v: null }
+    initialTree = await createFullTransportTreeFromLoaderTree(
+      tree,
+      errorHints,
+      errorPrefetchInliningEnabled,
+      ctx.missingPrefetchHintPolicy,
+      partialPrefetching,
+      getDynamicParamFromSegment,
+      ctx.renderOpts.notFoundParams
+    )
+    // Attach the error shell as the root's render output. Vary params are not
+    // tracked for error pages.
+    initialTree.d = { r: errorShell, p: false, v: null }
+  }
 
   const { GlobalError, styles: globalErrorStyles } = await getGlobalErrorStyles(
     tree,
@@ -2443,12 +2533,17 @@ function ErrorApp<T>({
 
   const actionQueue = createMutableActionQueue(initialState)
 
+  const { HeadManagerContext } =
+    require('../../shared/lib/head-manager-context.shared-runtime') as typeof import('../../shared/lib/head-manager-context.shared-runtime')
+
   return (
-    <ImageConfigContext.Provider value={images ?? imageConfigDefault}>
-      <ServerInsertedHTMLProvider>
-        <AppRouter actionQueue={actionQueue} globalErrorState={response.G} />
-      </ServerInsertedHTMLProvider>
-    </ImageConfigContext.Provider>
+    <HeadManagerContext.Provider value={{ appDir: true, nonce }}>
+      <ImageConfigContext.Provider value={images ?? imageConfigDefault}>
+        <ServerInsertedHTMLProvider>
+          <AppRouter actionQueue={actionQueue} globalErrorState={response.G} />
+        </ServerInsertedHTMLProvider>
+      </ImageConfigContext.Provider>
+    </HeadManagerContext.Provider>
   )
   /* eslint-enable @next/internal/no-ambiguous-jsx -- React Client */
 }
@@ -4509,7 +4604,8 @@ async function renderToStream(
             reactServerErrorsByDigest.has((err as any).digest) ? null : err,
             errorType,
             // Normal error rendering should include the error payload head.
-            true
+            true,
+            false
           )
 
           errorServerStream = workUnitAsyncStorage.run(
@@ -4603,7 +4699,8 @@ async function renderToStream(
             reactServerErrorsByDigest.has((err as any).digest) ? null : err,
             errorType,
             // Normal error rendering should include the error payload head.
-            true
+            true,
+            false
           )
 
           errorServerStream = workUnitAsyncStorage.run(
@@ -10577,6 +10674,15 @@ async function prerenderToStream(
         isFallbackUpgradeable: renderOpts.isFallbackUpgradeable === true,
       }
 
+      // A completed static 404 should render its nearest not-found boundary
+      // into the initial document. A dynamic prerender still needs its
+      // resumable shell, and fallback parameter routes retain their original
+      // recovery path.
+      const recoverCompletedStaticNotFound =
+        errorType === 'not-found' &&
+        originalFlightPrerenderResultIsDynamic === false &&
+        (fallbackRouteParams === null || fallbackRouteParams.size === 0)
+
       const errorRSCPayload = await workUnitAsyncStorage.run(
         errorPrerenderStore,
         getErrorRSCPayload,
@@ -10584,9 +10690,10 @@ async function prerenderToStream(
         ctx,
         reactServerErrorsByDigest.has((err as any)?.digest) ? undefined : err,
         errorType,
-        // The recovery shell only bootstraps the original Flight data. Avoid
-        // blocking that shell on error-page metadata or viewport.
-        false
+        // For completed static 404s the fallback is the document, not just a
+        // resumable shell. Other recovery paths bootstrap the original data.
+        recoverCompletedStaticNotFound,
+        true
       )
 
       const errorServerResult = await createReactServerPrerenderResult(
@@ -10823,9 +10930,24 @@ async function prerenderToStream(
           )
         }
 
+        // The fallback HTML must hydrate from its own Flight data. Keeping
+        // the failed page's original Flight can leave visible 404 links inert.
+        const inlinedFlightPrerenderResult = recoverCompletedStaticNotFound
+          ? errorServerResult
+          : originalFlightPrerenderResult
+        if (recoverCompletedStaticNotFound) {
+          const recoveredChunks = errorServerResult.asChunks()
+          metadata.flightData = Buffer.concat(
+            cachedNavigations
+              ? prependIsPartialByteToChunks(recoveredChunks, false)
+              : recoveredChunks
+          )
+          originalFlightPrerenderResult.consume()
+        }
+
         const stream = await continueStaticPrerenderWithInlinedData(
           errorHtmlStream,
-          originalFlightPrerenderResult,
+          inlinedFlightPrerenderResult,
           fallbackRouteParams,
           createInlinedDataStream,
           externalBrowserRuntime,
@@ -10842,7 +10964,9 @@ async function prerenderToStream(
           errorBootstrapScriptContent
         )
 
-        errorServerResult.consume()
+        if (!recoverCompletedStaticNotFound) {
+          errorServerResult.consume()
+        }
         return {
           error: errorType !== undefined ? undefined : { thrownValue: err },
           digestErrorsMap: renderErrorsByDigest,
@@ -10901,6 +11025,7 @@ async function prerenderToStream(
       reactServerErrorsByDigest.has((err as any)?.digest) ? undefined : err,
       errorType,
       // Legacy prerender recovery should include the error payload head.
+      true,
       true
     )
 

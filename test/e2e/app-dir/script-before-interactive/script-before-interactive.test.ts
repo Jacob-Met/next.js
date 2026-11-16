@@ -47,6 +47,35 @@ describe('Script component with beforeInteractive strategy CSS class rendering',
     expect(scriptInHead).toBe(true)
   })
 
+  for (const [route, notFoundId] of [
+    ['/trigger-not-found', 'not-found-content'],
+    ['/section/trigger-not-found', 'section-not-found'],
+    ['/does-not-exist', 'not-found-content'],
+  ]) {
+    it(`runs the root beforeInteractive scripts on 404 page ${route}`, async () => {
+      const response = await next.fetch(route)
+      expect(response.status).toBe(404)
+      const html = await response.text()
+      const visibleMarkup =
+        notFoundId === 'not-found-content'
+          ? '<main id="not-found-content">'
+          : '<div id="section-not-found">'
+      expect(html.includes(visibleMarkup)).toBe(true)
+      expect(html).toContain('name="robots" content="noindex"')
+
+      const browser = await next.browser(route)
+      const renderedNotFound = await browser.eval((id) => {
+        return document.getElementById(id) !== null
+      }, notFoundId)
+      expect(renderedNotFound).toBe(true)
+      const executed = await browser.eval(() => ({
+        inline: (window as any).rootBeforeInteractiveExecuted === true,
+        external: (window as any).criticalConsentScriptExecuted === true,
+      }))
+      expect(executed).toEqual({ inline: true, external: true })
+    })
+  }
+
   it('should render multiple beforeInteractive scripts with correct class attributes', async () => {
     const browser = await next.browser('/multiple')
 
