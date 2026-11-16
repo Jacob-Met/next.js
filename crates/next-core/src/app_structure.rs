@@ -2379,6 +2379,13 @@ async fn directory_tree_to_entrypoints_internal_untraced(
             );
         }
 
+        // Route handlers, metadata and layouts must not replace a Pages Router
+        // custom 404. Only renderable App pages or explicit not-found files
+        // need the implicit App 404. Continue below to collect route handlers.
+        let needs_app_not_found = *directory_tree_has_pages(directory_tree_vc).await?
+            || modules.not_found.is_some()
+            || modules.global_not_found.is_some();
+
         let mut modules = directory_tree.modules.clone();
 
         // fill in the default modules for the not-found entrypoint
@@ -2507,14 +2514,16 @@ async fn directory_tree_to_entrypoints_internal_untraced(
                 .clone_push_str("_not-found")?
                 .complete(PageType::Page)?;
 
-            add_app_page(
-                app_dir.clone(),
-                &mut result,
-                app_page,
-                not_found_tree,
-                Vec::new(),
-                root_params,
-            );
+            if needs_app_not_found {
+                add_app_page(
+                    app_dir.clone(),
+                    &mut result,
+                    app_page,
+                    not_found_tree,
+                    Vec::new(),
+                    root_params,
+                );
+            }
         }
 
         // Create production global error page only in build mode
@@ -2875,6 +2884,22 @@ impl Issue for NestedInCatchAllSegmentIssue {
             "https://nextjs.org/docs/app/api-reference/file-conventions/dynamic-routes#catch-all-segments"
         )
     }
+}
+
+/// Returns whether this tree contains a renderable App Router page, rather than
+/// just API route handlers, metadata endpoints, or layout modules.
+#[turbo_tasks::function]
+async fn directory_tree_has_pages(directory_tree: Vc<DirectoryTree>) -> Result<Vc<bool>> {
+    let tree = &*directory_tree.await?;
+    if tree.modules.page.is_some() {
+        return Ok(Vc::cell(true));
+    }
+    for child in tree.subdirectories.values() {
+        if *directory_tree_has_pages(**child).await? {
+            return Ok(Vc::cell(true));
+        }
+    }
+    Ok(Vc::cell(false))
 }
 
 /// Returns whether the directory tree contains a file that creates an entrypoint (a page, a route

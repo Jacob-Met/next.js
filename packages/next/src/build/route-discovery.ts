@@ -346,7 +346,12 @@ export async function createPagesMapping({
       return pages
     }
     case PAGE_TYPES.APP: {
-      const hasAppPages = Object.keys(pages).length > 0
+      // Route handlers and metadata endpoints do not create renderable App
+      // pages, so neither should replace a Pages Router custom 404.
+      const hasAppPages = pagePaths.some((pagePath) => {
+        const entry = getPageFromPath(pagePath, pageExtensions)
+        return /(?:^|\/)page$/.test(entry) || entry === 'not-found'
+      })
       const hasAppGlobalError = !isDev && appDirOnly
       return {
         ...(hasAppPages && {
